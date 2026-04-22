@@ -1,62 +1,64 @@
 #include <Arduino.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <Adafruit_BMP5xx.h>
+#include <Adafruit_INA219.h>
 #include <TinyGPSPlus.h>
 
+MPU6050 mpu;
+Adafruit_BMP5xx bmp;
+Adafruit_INA219 ina219(0x40);
 TinyGPSPlus gps;
+
+static uint32_t lastPrint = 0;
 
 void setup() {
     Serial.begin(115200);
-    while (!Serial);
     Serial1.begin(9600);
-    Serial.println("TinyGPSPlus GPS test — Serial1 @ 9600 baud");
-    Serial.println("-------------------------------------------");
+    while (!Serial && millis() < 3000);
+
+    Wire.begin();
+    Wire.setClock(400000);
+
+    mpu.initialize();
+
+    bmp.begin((uint8_t)0x47);
+
+    ina219.begin();
 }
 
 void loop() {
-    while (Serial1.available()) {
-        char c = Serial1.read();
+    while (Serial1.available())
+        gps.encode(Serial1.read());
 
-        // Print raw NMEA character-by-character; newline on '\n'
-        if (c == '\r') {
-            // skip bare CR
-        } else if (c == '\n') {
-            Serial.println();
-        } else {
-            Serial.write(c);
-        }
+    if (millis() - lastPrint < 100)
+        return;
+    lastPrint = millis();
 
-        // Feed to TinyGPSPlus; print parsed fix whenever a sentence completes
-        if (gps.encode(c) && gps.location.isUpdated()) {
-            Serial.println();
-            Serial.println("=== Parsed Fix ===");
+    // MPU6050 roll/pitch from raw accel
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    float axf = ax / 16384.0f;
+    float ayf = ay / 16384.0f;
+    float azf = az / 16384.0f;
+    float roll  = atan2f(ayf, azf) * 180.0f / M_PI;
+    float pitch = atan2f(-axf, sqrtf(ayf * ayf + azf * azf)) * 180.0f / M_PI;
 
-            Serial.print("  Lat:  ");
-            if (gps.location.isValid())
-                Serial.println(gps.location.lat(), 6);
-            else
-                Serial.println("INVALID");
+    // BMP580
+    bmp.performReading();
+    float temp_c   = bmp.temperature;
+    float pressure = bmp.pressure;
+    float altitude = bmp.readAltitude(1013.25);
 
-            Serial.print("  Lon:  ");
-            if (gps.location.isValid())
-                Serial.println(gps.location.lng(), 6);
-            else
-                Serial.println("INVALID");
+    // INA219
+    float busV = ina219.getBusVoltage_V();
 
-            Serial.print("  Alt:  ");
-            if (gps.altitude.isValid()) {
-                Serial.print(gps.altitude.meters(), 1);
-                Serial.println(" m");
-            } else {
-                Serial.println("INVALID");
-            }
+    // GPS
+    float lat = gps.location.isValid() ? (float)gps.location.lat() : 0.0f;
+    float lon = gps.location.isValid() ? (float)gps.location.lng() : 0.0f;
 
-            Serial.print("  Sats: ");
-            if (gps.satellites.isValid())
-                Serial.println(gps.satellites.value());
-            else
-                Serial.println("INVALID");
-
-            Serial.println("==================");
-            Serial.println();
-        }
-    }
+    Serial.printf(
+        "roll=%.2f pitch=%.2f | alt=%.2fm temp=%.1fC | bus=%.2fV | lat=%.6f lon=%.6f\n",
+        roll, pitch, altitude, temp_c, busV, lat, lon
+    );
 }
