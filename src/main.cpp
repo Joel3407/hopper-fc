@@ -1,81 +1,62 @@
 #include <Arduino.h>
-#include <Wire.h>
-#include <MPU6050_6Axis_MotionApps20.h>
+#include <TinyGPSPlus.h>
 
-MPU6050 mpu(0x68);
-
-bool dmpReady = false;
-uint8_t devStatus;
-uint16_t packetSize;
-uint8_t fifoBuffer[64];
-
-Quaternion q;
-VectorFloat gravity;
-float ypr[3];
-VectorInt16 accel;
-VectorInt16 gyro;
+TinyGPSPlus gps;
 
 void setup() {
     Serial.begin(115200);
     while (!Serial);
-
-    Wire.begin();
-    Wire.setClock(400000);
-
-    Serial.println("Initializing MPU-6050...");
-    mpu.initialize();
-
-    if (!mpu.testConnection()) {
-        Serial.println("MPU-6050 connection FAILED");
-        while (1);
-    }
-    Serial.println("MPU-6050 connected");
-
-    devStatus = mpu.dmpInitialize();
-    if (devStatus != 0) {
-        Serial.print("DMP init failed: ");
-        Serial.println(devStatus);
-        while (1);
-    }
-
-    mpu.CalibrateAccel(6);
-    mpu.CalibrateGyro(6);
-    mpu.setDMPEnabled(true);
-    packetSize = mpu.dmpGetFIFOPacketSize();
-    dmpReady = true;
-    Serial.println("DMP ready\n");
+    Serial1.begin(9600);
+    Serial.println("TinyGPSPlus GPS test — Serial1 @ 9600 baud");
+    Serial.println("-------------------------------------------");
 }
 
 void loop() {
-    static uint32_t lastPrint = 0;
-    if (!dmpReady) return;
+    while (Serial1.available()) {
+        char c = Serial1.read();
 
-    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
-        mpu.dmpGetQuaternion(&q, fifoBuffer);
-        mpu.dmpGetGravity(&gravity, &q);
-        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-        mpu.dmpGetAccel(&accel, fifoBuffer);
-        mpu.dmpGetGyro(&gyro, fifoBuffer);
-    }
+        // Print raw NMEA character-by-character; newline on '\n'
+        if (c == '\r') {
+            // skip bare CR
+        } else if (c == '\n') {
+            Serial.println();
+        } else {
+            Serial.write(c);
+        }
 
-    if (millis() - lastPrint >= 100) {
-        lastPrint = millis();
+        // Feed to TinyGPSPlus; print parsed fix whenever a sentence completes
+        if (gps.encode(c) && gps.location.isUpdated()) {
+            Serial.println();
+            Serial.println("=== Parsed Fix ===");
 
-        Serial.print("YPR  ");
-        Serial.print(ypr[0] * 180.0f / M_PI, 2);
-        Serial.print("  ");
-        Serial.print(ypr[1] * 180.0f / M_PI, 2);
-        Serial.print("  ");
-        Serial.print(ypr[2] * 180.0f / M_PI, 2);
+            Serial.print("  Lat:  ");
+            if (gps.location.isValid())
+                Serial.println(gps.location.lat(), 6);
+            else
+                Serial.println("INVALID");
 
-        Serial.print("  |  A ");
-        Serial.print(accel.x); Serial.print(" ");
-        Serial.print(accel.y); Serial.print(" ");
-        Serial.print(accel.z);
+            Serial.print("  Lon:  ");
+            if (gps.location.isValid())
+                Serial.println(gps.location.lng(), 6);
+            else
+                Serial.println("INVALID");
 
-        Serial.print("  |  G ");
-        Serial.print(gyro.x); Serial.print(" ");
-        Serial.print(gyro.y); Serial.print(" ");
-        Serial.println(gyro.z);
+            Serial.print("  Alt:  ");
+            if (gps.altitude.isValid()) {
+                Serial.print(gps.altitude.meters(), 1);
+                Serial.println(" m");
+            } else {
+                Serial.println("INVALID");
+            }
+
+            Serial.print("  Sats: ");
+            if (gps.satellites.isValid())
+                Serial.println(gps.satellites.value());
+            else
+                Serial.println("INVALID");
+
+            Serial.println("==================");
+            Serial.println();
+        }
     }
 }
