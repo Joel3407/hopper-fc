@@ -1,32 +1,81 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_INA219.h>
+#include <MPU6050_6Axis_MotionApps20.h>
 
-Adafruit_INA219 ina219(0x40);
+MPU6050 mpu(0x68);
+
+bool dmpReady = false;
+uint8_t devStatus;
+uint16_t packetSize;
+uint8_t fifoBuffer[64];
+
+Quaternion q;
+VectorFloat gravity;
+float ypr[3];
+VectorInt16 accel;
+VectorInt16 gyro;
 
 void setup() {
     Serial.begin(115200);
-    while (!Serial && millis() < 3000);
+    while (!Serial);
 
     Wire.begin();
+    Wire.setClock(400000);
 
-    if (!ina219.begin()) {
-        Serial.println("ERROR: INA219 not found at 0x40");
+    Serial.println("Initializing MPU-6050...");
+    mpu.initialize();
+
+    if (!mpu.testConnection()) {
+        Serial.println("MPU-6050 connection FAILED");
+        while (1);
+    }
+    Serial.println("MPU-6050 connected");
+
+    devStatus = mpu.dmpInitialize();
+    if (devStatus != 0) {
+        Serial.print("DMP init failed: ");
+        Serial.println(devStatus);
         while (1);
     }
 
-    Serial.println("INA219 ready");
-    Serial.println("Bus(V)\tCurrent(mA)\tPower(mW)");
+    mpu.CalibrateAccel(6);
+    mpu.CalibrateGyro(6);
+    mpu.setDMPEnabled(true);
+    packetSize = mpu.dmpGetFIFOPacketSize();
+    dmpReady = true;
+    Serial.println("DMP ready\n");
 }
 
 void loop() {
-    float busV   = ina219.getBusVoltage_V();
-    float currentMA = ina219.getCurrent_mA();
-    float powerMW   = ina219.getPower_mW();
+    static uint32_t lastPrint = 0;
+    if (!dmpReady) return;
 
-    Serial.print(busV, 3);     Serial.print(" V\t");
-    Serial.print(currentMA, 2); Serial.print(" mA\t");
-    Serial.print(powerMW, 2);   Serial.println(" mW");
+    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
+        mpu.dmpGetQuaternion(&q, fifoBuffer);
+        mpu.dmpGetGravity(&gravity, &q);
+        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+        mpu.dmpGetAccel(&accel, fifoBuffer);
+        mpu.dmpGetGyro(&gyro, fifoBuffer);
+    }
 
-    delay(500);
+    if (millis() - lastPrint >= 100) {
+        lastPrint = millis();
+
+        Serial.print("YPR  ");
+        Serial.print(ypr[0] * 180.0f / M_PI, 2);
+        Serial.print("  ");
+        Serial.print(ypr[1] * 180.0f / M_PI, 2);
+        Serial.print("  ");
+        Serial.print(ypr[2] * 180.0f / M_PI, 2);
+
+        Serial.print("  |  A ");
+        Serial.print(accel.x); Serial.print(" ");
+        Serial.print(accel.y); Serial.print(" ");
+        Serial.print(accel.z);
+
+        Serial.print("  |  G ");
+        Serial.print(gyro.x); Serial.print(" ");
+        Serial.print(gyro.y); Serial.print(" ");
+        Serial.println(gyro.z);
+    }
 }
