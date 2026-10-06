@@ -612,6 +612,41 @@ void log_data() {
     // f.close();
 }
 
+// =============================================================================
+// send_telemetry() — binary frame on SerialUSB1 at 10 Hz (ground station).
+// Frame: 0xAA 0x55 | state u8 | roll, pitch, alt_agl, throttle(0..1), vbat
+//        (float32 LE each) | XOR checksum of payload. 24 bytes total.
+// Teensy 4.1 is little-endian, so memcpy of floats is already LE.
+// =============================================================================
+static constexpr uint32_t TELEM_PERIOD_MS = 100;  // 10 Hz
+
+void send_telemetry() {
+    static uint32_t last_ms = 0;
+    uint32_t now = millis();
+    if (now - last_ms < TELEM_PERIOD_MS) return;
+    last_ms = now;
+
+    uint8_t frame[2 + 1 + 5 * 4 + 1];
+    frame[0] = 0xAA;
+    frame[1] = 0x55;
+    frame[2] = (uint8_t)flight_state;
+
+    float vals[5] = {
+        state_est.roll_deg,
+        state_est.pitch_deg,
+        state_est.alt_agl_m,
+        (cmds.throttle_us - 1000) / 1000.0f,
+        sensors.bus_v,
+    };
+    memcpy(&frame[3], vals, sizeof(vals));
+
+    uint8_t cs = 0;
+    for (size_t i = 2; i < sizeof(frame) - 1; i++) cs ^= frame[i];
+    frame[sizeof(frame) - 1] = cs;
+
+    SerialUSB1.write(frame, sizeof(frame));
+}
+
 
 // =============================================================================
 // SECTION 12 — handle_serial()
@@ -756,4 +791,5 @@ void loop() {
     actuate();             // Section 10: servo + ESC writes
     log_data();            // Section 11: SD card (placeholder)
     handle_serial();       // Section 12: command parsing
+    send_telemetry();      // 10 Hz binary frame on SerialUSB1
 }
