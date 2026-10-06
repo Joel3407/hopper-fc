@@ -9,7 +9,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <MPU6050.h>          // ElectronicCats/MPU6050
+#include <Adafruit_BNO08x.h>
 #include <Adafruit_BMP5xx.h>
 #include <Adafruit_INA219.h>
 #include <TinyGPSPlus.h>
@@ -29,7 +29,8 @@ static constexpr uint32_t LOOP_PERIOD_US = 1000000UL / LOOP_HZ;
 // ---- I2C addresses ----------------------------------------------------------
 static constexpr uint8_t ADDR_BMP5XX = 0x47;
 static constexpr uint8_t ADDR_INA219 = 0x40;
-// MPU6050 defaults to 0x68 (AD0 low)
+static constexpr uint8_t ADDR_BNO08X_PRIMARY   = 0x4B;
+static constexpr uint8_t ADDR_BNO08X_FALLBACK  = 0x4A;
 
 // ---- Safety limits ----------------------------------------------------------
 static constexpr float VBAT_MIN_V     = 19.8f;  // 6S @ ~3.3V/cell
@@ -47,8 +48,13 @@ static constexpr int HOVER_BASE_US   = 1500;  // 50% throttle — tune on bench
 static constexpr float VANE_SCALE   = 5.0f;   // PID units → servo µs delta
 static constexpr float ALT_SCALE    = 10.0f;  // altitude PID units → ESC µs delta
 
-// ---- Complementary filter ---------------------------------------------------
-static constexpr float CF_ALPHA = 0.98f;  // gyro weight (0.98 = ~16Hz crossover)
+// ---- BNO08X report rate -----------------------------------------------------
+static constexpr uint32_t BNO_REPORT_INTERVAL_US = 10000;  // 100 Hz
+
+// ---- IMU axis signs ---------------------------------------------------------
+// Set to -1.0f to flip an axis if the bench test shows roll/pitch reversed.
+static constexpr float ROLL_SIGN  = 1.0f;
+static constexpr float PITCH_SIGN = 1.0f;
 
 // ---- Kalman filter tuning (altitude + velocity) -----------------------------
 static constexpr float KF_Q_ALT  = 0.1f;  // process noise: altitude (m²)
@@ -56,7 +62,10 @@ static constexpr float KF_Q_VEL  = 1.0f;  // process noise: velocity (m²/s²)
 static constexpr float KF_R_BARO = 2.0f;  // baro measurement noise (m²)
 
 // ---- Baro ground calibration ------------------------------------------------
+static constexpr int BARO_CAL_DISCARD = 10;  // settling readings thrown away after begin()
 static constexpr int BARO_CAL_SAMPLES = 50;
+static constexpr int BARO_BEGIN_TRIES = 5;
+static constexpr int BARO_BEGIN_RETRY_MS = 100;
 
 // ---- PID gains --------------------------------------------------------------
 struct PIDGains { float kp, ki, kd; };
@@ -81,21 +90,20 @@ static constexpr float LAND_VEL_THRESH  = 0.3f;   // vertical speed to declare l
 // =============================================================================
 
 // ---- Hardware objects -------------------------------------------------------
-MPU6050         mpu;
+Adafruit_BNO08x bno08x;
 Adafruit_BMP5xx bmp;
 Adafruit_INA219 ina219(ADDR_INA219);
 TinyGPSPlus     gps;
 Servo           servo_N, servo_E, servo_S, servo_W, esc_servo;
 
 bool ina219_ok = false;
+sh2_SensorValue_t bno_value;
 
 // ---- Raw sensor readings ----------------------------------------------------
 struct SensorData {
-    // MPU6050
-    int16_t ax_raw, ay_raw, az_raw;
-    int16_t gx_raw, gy_raw, gz_raw;
-    float   ax_g, ay_g, az_g;        // body-frame accel (g)
-    float   gx_dps, gy_dps, gz_dps;  // body-frame rate (°/s)
+    // BNO08X (latest values from the report stream)
+    float   quat_w, quat_x, quat_y, quat_z;  // game rotation vector
+    float   lin_accel_z_mps2;                // linear accel z, gravity removed (m/s²)
     // BMP5xx
     float   pressure_hpa;
     float   temp_c;
@@ -114,7 +122,7 @@ struct StateEstimate {
     float roll_deg, pitch_deg, yaw_deg;
     float alt_agl_m;    // Kalman altitude above ground level (m)
     float vel_z_mps;    // Kalman vertical velocity (m/s, up positive)
-    float accel_z_g;    // body-frame az minus gravity, used for Kalman predict
+    float accel_z_g;    // linear accel z (gravity-free), used for Kalman predict
 };
 
 // ---- Control outputs --------------------------------------------------------
@@ -172,6 +180,14 @@ bool     led_state       = false;
 // Non-fatal failures print a warning and continue.
 // =============================================================================
 
+// Enable Game Rotation Vector + Linear Acceleration at 100 Hz.
+// Called from setup() and again whenever the BNO08X reports a reset.
+static bool enable_bno_reports() {
+    bool ok = bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, BNO_REPORT_INTERVAL_US);
+    ok &= bno08x.enableReport(SH2_LINEAR_ACCELERATION, BNO_REPORT_INTERVAL_US);
+    return ok;
+}
+
 void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);
@@ -181,19 +197,31 @@ void setup() {
     while (!Serial && millis() < 3000);
 
     Wire.begin();
-    Wire.setClock(400000);
+    Wire.setClock(100000);  // BNO08X needs 100 kHz I2C
 
-    // ---- MPU6050 (fatal: no IMU = no flight) --------------------------------
-    mpu.initialize();
-    if (!mpu.testConnection()) {
-        Serial.println("FATAL: MPU6050 not found at 0x68");
+    // ---- BNO08X (fatal: no IMU = no flight) ---------------------------------
+    if (bno08x.begin_I2C(ADDR_BNO08X_PRIMARY, &Wire)) {
+        Serial.println("OK: BNO08X at 0x4B");
+    } else if (bno08x.begin_I2C(ADDR_BNO08X_FALLBACK, &Wire)) {
+        Serial.println("OK: BNO08X at 0x4A");
+    } else {
+        Serial.println("FATAL: BNO08X not found");
         fatal_err = true;
         return;
     }
-    Serial.println("OK: MPU6050");
+    if (!enable_bno_reports()) {
+        Serial.println("FATAL: BNO08X not found");  // reports failed: treat as no IMU
+        fatal_err = true;
+        return;
+    }
 
     // ---- BMP5xx (fatal: no baro = no altitude) ------------------------------
-    if (!bmp.begin(ADDR_BMP5XX)) {
+    bool bmp_ok = false;
+    for (int i = 0; i < BARO_BEGIN_TRIES && !bmp_ok; i++) {
+        bmp_ok = bmp.begin(ADDR_BMP5XX);
+        if (!bmp_ok) delay(BARO_BEGIN_RETRY_MS);
+    }
+    if (!bmp_ok) {
         Serial.println("FATAL: BMP5xx not found at 0x47");
         fatal_err = true;
         return;
@@ -223,6 +251,11 @@ void setup() {
 
     // ---- Baro ground calibration for AGL reference --------------------------
     Serial.print("Calibrating baro ground level");
+    // Discard first BARO_CAL_DISCARD readings after begin() (sensor settling)
+    for (int i = 0; i < BARO_CAL_DISCARD; i++) {
+        bmp.performReading();
+        delay(20);
+    }
     float alt_sum = 0.0f;
     int   samples = 0;
     for (int i = 0; i < BARO_CAL_SAMPLES; i++) {
@@ -249,17 +282,41 @@ void setup() {
 // =============================================================================
 
 void read_sensors() {
-    // ---- MPU6050 ------------------------------------------------------------
-    mpu.getMotion6(&sensors.ax_raw, &sensors.ay_raw, &sensors.az_raw,
-                   &sensors.gx_raw, &sensors.gy_raw, &sensors.gz_raw);
-    // ±2g range: 16384 LSB/g
-    sensors.ax_g = sensors.ax_raw / 16384.0f;
-    sensors.ay_g = sensors.ay_raw / 16384.0f;
-    sensors.az_g = sensors.az_raw / 16384.0f;
-    // ±250°/s range: 131 LSB/(°/s)
-    sensors.gx_dps = sensors.gx_raw / 131.0f;
-    sensors.gy_dps = sensors.gy_raw / 131.0f;
-    sensors.gz_dps = sensors.gz_raw / 131.0f;
+    // ---- BNO08X: re-enable reports after a reset, then drain the event queue
+    if (bno08x.wasReset()) {
+        Serial.println("WARNING: BNO08X reset — re-enabling reports");
+        enable_bno_reports();
+    }
+    while (bno08x.getSensorEvent(&bno_value)) {
+        switch (bno_value.sensorId) {
+        case SH2_GAME_ROTATION_VECTOR:
+            sensors.quat_w = bno_value.un.gameRotationVector.real;
+            sensors.quat_x = bno_value.un.gameRotationVector.i;
+            sensors.quat_y = bno_value.un.gameRotationVector.j;
+            sensors.quat_z = bno_value.un.gameRotationVector.k;
+            break;
+        case SH2_LINEAR_ACCELERATION:
+            sensors.lin_accel_z_mps2 = bno_value.un.linearAcceleration.z;
+            break;
+        }
+    }
+
+    // Quaternion → roll/pitch/yaw (degrees), written straight to the estimate.
+    // Game rotation vector has no magnetometer, so yaw drifts slowly.
+    {
+        const float w = sensors.quat_w, x = sensors.quat_x;
+        const float y = sensors.quat_y, z = sensors.quat_z;
+        const float RAD2DEG = 180.0f / M_PI;
+        float roll  = atan2f(2.0f * (w * x + y * z), 1.0f - 2.0f * (x * x + y * y));
+        float pitch = asinf(constrain(2.0f * (w * y - z * x), -1.0f, 1.0f));
+        float yaw   = atan2f(2.0f * (w * z + x * y), 1.0f - 2.0f * (y * y + z * z));
+        // Axis signs: flip ROLL_SIGN / PITCH_SIGN (Section 1) if bench test shows reversed.
+        state_est.roll_deg  = ROLL_SIGN  * roll  * RAD2DEG;
+        state_est.pitch_deg = PITCH_SIGN * pitch * RAD2DEG;
+        state_est.yaw_deg   = yaw * RAD2DEG;
+    }
+    // Linear acceleration is already gravity-free: do not subtract 1 g.
+    state_est.accel_z_g = sensors.lin_accel_z_mps2 / 9.81f;
 
     // ---- BMP5xx -------------------------------------------------------------
     if (bmp.performReading()) {
@@ -284,37 +341,6 @@ void read_sensors() {
         sensors.lon       = gps.location.lng();
         sensors.gps_alt_m = (float)gps.altitude.meters();
     }
-}
-
-
-// =============================================================================
-// SECTION 5 — estimate_attitude(dt)
-// Complementary filter: roll/pitch from accel + gyro fusion.
-// Yaw: gyro-only integration (no magnetometer).
-// Assumes sensor Z+ is up when the vehicle is level.
-// =============================================================================
-
-void estimate_attitude(float dt) {
-    // Accel-derived angles — accurate at low frequency, noisy at high frequency
-    float accel_roll  = atan2f(sensors.ay_g, sensors.az_g) * (180.0f / M_PI);
-    float accel_pitch = atan2f(-sensors.ax_g,
-                                sqrtf(sensors.ay_g * sensors.ay_g +
-                                      sensors.az_g * sensors.az_g)) * (180.0f / M_PI);
-
-    // Blend: 98% gyro integration, 2% accel correction per tick
-    state_est.roll_deg  = CF_ALPHA * (state_est.roll_deg  + sensors.gx_dps * dt)
-                        + (1.0f - CF_ALPHA) * accel_roll;
-    state_est.pitch_deg = CF_ALPHA * (state_est.pitch_deg + sensors.gy_dps * dt)
-                        + (1.0f - CF_ALPHA) * accel_pitch;
-
-    // Yaw: integrate gyro, wrap to ±180°
-    state_est.yaw_deg += sensors.gz_dps * dt;
-    if (state_est.yaw_deg >  180.0f) state_est.yaw_deg -= 360.0f;
-    if (state_est.yaw_deg < -180.0f) state_est.yaw_deg += 360.0f;
-
-    // Vertical accel for Kalman: subtract 1g gravity (valid near-level only;
-    // a full implementation would rotate to world frame via attitude DCM).
-    state_est.accel_z_g = sensors.az_g - 1.0f;
 }
 
 
@@ -723,8 +749,7 @@ void loop() {
     if (dt > 0.05f) dt = 0.01f;
 
     // ---- Flight pipeline ---------------------------------------------------
-    read_sensors();       // Section 4: raw sensor reads
-    estimate_attitude(dt); // Section 5: complementary filter
+    read_sensors();       // Section 4: sensor reads + BNO08X attitude
     estimate_altitude(dt); // Section 6: Kalman filter
     safety_check();        // Section 7: limit enforcement
     run_state_machine(dt); // Section 8: state logic + PID compute
