@@ -38,11 +38,13 @@ static constexpr float TILT_LIMIT_DEG = 45.0f;
 static constexpr float ALT_LIMIT_M    = 20.0f;
 
 // ---- Servo / ESC limits -----------------------------------------------------
+// UNTESTED ON HARDWARE: no servos, ESC, vanes or fan exist yet. All servo/ESC
+// values below (limits, centre, scaling) are untested placeholders.
 static constexpr int SERVO_CENTER_US = 1500;
 static constexpr int VANE_MAX_DELTA  = 400;   // ±µs from center
 static constexpr int ESC_IDLE_US     = 1000;
 static constexpr int ESC_MAX_US      = 2000;
-static constexpr int HOVER_BASE_US   = 1500;  // 50% throttle — tune on bench
+static constexpr int HOVER_BASE_US   = 1500;  // UNVERIFIED guess (50% throttle); no fan to tune against yet
 
 // ---- Control scaling --------------------------------------------------------
 static constexpr float VANE_SCALE   = 5.0f;   // PID units → servo µs delta
@@ -52,7 +54,8 @@ static constexpr float ALT_SCALE    = 10.0f;  // altitude PID units → ESC µs 
 static constexpr uint32_t BNO_REPORT_INTERVAL_US = 10000;  // 100 Hz
 
 // ---- IMU axis signs ---------------------------------------------------------
-// Set to -1.0f to flip an axis if the bench test shows roll/pitch reversed.
+// UNVERIFIED: sign and mounting orientation have not been checked against a real
+// airframe. Set to -1.0f to flip an axis if a bench test shows it reversed.
 static constexpr float ROLL_SIGN  = 1.0f;
 static constexpr float PITCH_SIGN = 1.0f;
 
@@ -210,7 +213,7 @@ void setup() {
         return;
     }
     if (!enable_bno_reports()) {
-        Serial.println("FATAL: BNO08X not found");  // reports failed: treat as no IMU
+        Serial.println("FATAL: BNO08X found but enabling reports failed");
         fatal_err = true;
         return;
     }
@@ -272,7 +275,7 @@ void setup() {
     kf_vel = 0.0f;
     Serial.printf("Ground MSL = %.2f m  (AGL will be relative to this)\n", ground_alt_msl);
 
-    Serial.println("=== HOPPER-FC READY ===  a=arm  d=disarm  t=takeoff  l=land  x=abort  s=status");
+    Serial.println("=== HOPPER-FC READY ===  a=arm  d=disarm  t=takeoff  l=land  x=abort  r=reset(from ABORT)  s=status");
 }
 
 
@@ -310,7 +313,7 @@ void read_sensors() {
         float roll  = atan2f(2.0f * (w * x + y * z), 1.0f - 2.0f * (x * x + y * y));
         float pitch = asinf(constrain(2.0f * (w * y - z * x), -1.0f, 1.0f));
         float yaw   = atan2f(2.0f * (w * z + x * y), 1.0f - 2.0f * (y * y + z * z));
-        // Axis signs: flip ROLL_SIGN / PITCH_SIGN (Section 1) if bench test shows reversed.
+        // Axis signs: flip ROLL_SIGN / PITCH_SIGN (Section 1, unverified) if bench test shows reversed.
         state_est.roll_deg  = ROLL_SIGN  * roll  * RAD2DEG;
         state_est.pitch_deg = PITCH_SIGN * pitch * RAD2DEG;
         state_est.yaw_deg   = yaw * RAD2DEG;
@@ -345,7 +348,7 @@ void read_sensors() {
 
 
 // =============================================================================
-// SECTION 6 — estimate_altitude(dt)
+// SECTION 5 — estimate_altitude(dt)
 // 2-state Kalman filter: x = [altitude_AGL, vertical_velocity]
 // Predict: dead-reckoning with body-frame accel_z (near-level approximation).
 // Update: baro altitude converted to AGL via ground_alt_msl.
@@ -386,7 +389,7 @@ void estimate_altitude(float dt) {
 
 
 // =============================================================================
-// SECTION 7 — safety_check()
+// SECTION 6 — safety_check()
 // Only active when flight_state >= ARMED.
 // Any limit breach triggers ABORT immediately.
 // =============================================================================
@@ -421,7 +424,7 @@ void safety_check() {
 
 
 // =============================================================================
-// SECTION 9 — PID Functions
+// SECTION 7 — PID Functions
 // Placed before run_state_machine() because the state machine calls them.
 //
 // compute_pid():     generic PID with derivative-on-measurement + anti-windup.
@@ -541,7 +544,7 @@ void run_state_machine(float dt) {
 
 
 // =============================================================================
-// SECTION 10 — actuate()
+// SECTION 9 — actuate()
 // Control allocation → servo microseconds and ESC output.
 //
 // Allocation (CLAUDE.md convention):
@@ -556,6 +559,7 @@ static int clamp_vane(int us) {
                          SERVO_CENTER_US + VANE_MAX_DELTA);
 }
 
+// UNTESTED ON HARDWARE: never run with real servos or an ESC attached.
 void actuate() {
     // Safe states: center all vanes, kill throttle
     if (flight_state == PREFLIGHT || flight_state == ARMED ||
@@ -583,7 +587,7 @@ void actuate() {
 
 
 // =============================================================================
-// SECTION 11 — log_data()
+// SECTION 10 — log_data()
 // SD card CSV logging placeholder. Uses Teensy 4.1 built-in SD slot.
 // Uncomment everything (and add #include <SD.h> above) when SD card arrives.
 // =============================================================================
@@ -613,9 +617,12 @@ void log_data() {
 }
 
 // =============================================================================
-// send_telemetry() — binary frame on SerialUSB1 at 10 Hz (ground station).
+// SECTION 11 — send_telemetry()
+// Binary frame on SerialUSB1 at 10 Hz (ground station).
 // Frame: 0xAA 0x55 | state u8 | roll, pitch, alt_agl, throttle(0..1), vbat
-//        (float32 LE each) | XOR checksum of payload. 24 bytes total.
+//        (float32 LE each) | XOR checksum. 24 bytes total.
+// The checksum covers the state byte plus the five floats (21 bytes); the
+// two sync bytes are not included.
 // Teensy 4.1 is little-endian, so memcpy of floats is already LE.
 // =============================================================================
 static constexpr uint32_t TELEM_PERIOD_MS = 100;  // 10 Hz
@@ -733,16 +740,16 @@ void handle_serial() {
         }
         break;
 
-    case 's':  // Status
+    case 's':  // Status (alt = Kalman-filtered AGL, baro = raw baro AGL)
         Serial.printf("[%s] roll=%.1f° pitch=%.1f° yaw=%.1f° | "
                       "alt=%.2fm vel=%.2fm/s | "
-                      "baro=%.2fm baro_raw=%.2fm | "
+                      "baro=%.2fm | "
                       "vbat=%.2fV I=%.0fmA | "
                       "gps=%s thr=%d µs\n",
                       state_name(flight_state),
                       state_est.roll_deg, state_est.pitch_deg, state_est.yaw_deg,
                       state_est.alt_agl_m, state_est.vel_z_mps,
-                      state_est.alt_agl_m, sensors.baro_alt_m - ground_alt_msl,
+                      sensors.baro_alt_m - ground_alt_msl,
                       sensors.bus_v, sensors.current_ma,
                       sensors.gps_valid ? "fix" : "no fix",
                       cmds.throttle_us);
@@ -784,12 +791,12 @@ void loop() {
     if (dt > 0.05f) dt = 0.01f;
 
     // ---- Flight pipeline ---------------------------------------------------
-    read_sensors();       // Section 4: sensor reads + BNO08X attitude
-    estimate_altitude(dt); // Section 6: Kalman filter
-    safety_check();        // Section 7: limit enforcement
+    read_sensors();        // Section 4: sensor reads + BNO08X attitude
+    estimate_altitude(dt); // Section 5: Kalman filter
+    safety_check();        // Section 6: limit enforcement
     run_state_machine(dt); // Section 8: state logic + PID compute
-    actuate();             // Section 10: servo + ESC writes
-    log_data();            // Section 11: SD card (placeholder)
-    handle_serial();       // Section 12: command parsing
-    send_telemetry();      // 10 Hz binary frame on SerialUSB1
+    actuate();              // Section 9: servo + ESC writes
+    log_data();             // Section 10: SD card (placeholder, does nothing)
+    handle_serial();        // Section 12: command parsing
+    send_telemetry();       // Section 11: 10 Hz binary frame on SerialUSB1
 }
