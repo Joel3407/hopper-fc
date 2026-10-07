@@ -34,8 +34,9 @@ Pin assignments in the code (`src/main.cpp`):
 | I2C (SDA/SCL) | Teensy default `Wire` (pins 18/19 on the Teensy 4.1, per the Teensy pinout; the code does not set them) |
 | GPS (RX/TX) | Teensy default `Serial1` (pins 0/1 on the Teensy 4.1, per the Teensy pinout; the code does not set them) |
 
-Note: a device answering at I2C address 0x7E shows up on a bus scan. It has not
-been identified, and the firmware does not use it.
+Note: a device answering at I2C address 0x7E shows up on a bus scan. It is
+unidentified, and no effect on the sensors or the firmware has been seen. The
+firmware does not use it.
 
 ## Architecture
 
