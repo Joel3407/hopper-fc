@@ -4,9 +4,12 @@ EDF HOPPER GROUND STATION
 
 Receives binary telemetry from the Teensy's second USB serial port
 (SerialUSB1) and displays:
-- Real-time plots (attitude, altitude, battery)
+- Real-time plots (attitude, altitude, throttle, battery)
 - Status text
-- Command uplink capability
+
+Receive-only: there is no command uplink. The firmware does not read
+SerialUSB1; flight commands (a/d/t/l/x/r/s) are typed on the Teensy's first
+USB serial port (e.g. the PlatformIO serial monitor).
 
 Frame format (little-endian, 24 bytes, sent at 10 Hz by send_telemetry()):
     0xAA 0x55 | state u8 | roll f32 | pitch f32 | altitude f32 |
@@ -20,8 +23,7 @@ Usage:
     python ground_station.py /dev/ttyACM1  (Linux/Mac)
     python ground_station.py COM3          (Windows)
 
-Author: Joel's Rocket Project
-Date: November 2025
+Author: Joel Boese
 """
 
 import serial
@@ -46,6 +48,9 @@ MAX_BUFFER = FRAME_SIZE * 50                     # cap for runaway garbage
 NO_BATTERY_V = 5.0   # below this, treat as "no battery connected"
 MIN_SAFE_V = 19.8
 
+# Telemetry rate sent by the firmware (send_telemetry(), TELEM_PERIOD_MS = 100)
+TELEMETRY_HZ = 10
+
 # Plot history length (seconds)
 HISTORY_TIME = 30
 
@@ -65,7 +70,7 @@ STATE_NAMES = {
 class TelemetryData:
     """Stores incoming telemetry with time history"""
     
-    def __init__(self, maxlen=3000):  # 30 sec at 100 Hz
+    def __init__(self, maxlen=(HISTORY_TIME + 1) * TELEMETRY_HZ):  # ~31 s at 10 Hz
         self.time = deque(maxlen=maxlen)
         self.state = deque(maxlen=maxlen)
         self.roll = deque(maxlen=maxlen)
@@ -206,12 +211,6 @@ def serial_reader_thread(port):
         print(f"Serial error: {e}")
         sys.exit(1)
 
-def send_command(ser, command):
-    """Send command to rocket"""
-    if ser and ser.is_open:
-        ser.write(command.encode())
-        print(f"Sent command: {command}")
-
 # ==================== PLOTTING ====================
 
 class RealtimePlotter:
@@ -339,31 +338,6 @@ BATTERY: {battery_str}
         self.anim = FuncAnimation(self.fig, self.update, interval=100, blit=False)
         plt.show()
 
-# ==================== COMMAND LINE INTERFACE ====================
-
-def command_interface(ser):
-    """Command line interface for sending commands"""
-    print("\n=== GROUND STATION COMMANDS ===")
-    print("  a - Arm")
-    print("  d - Disarm")
-    print("  t - Takeoff")
-    print("  l - Land")
-    print("  x - ABORT (emergency)")
-    print("  s - Status")
-    print("  q - Quit")
-    print("================================\n")
-    
-    while True:
-        cmd = input("Command: ").strip().lower()
-        
-        if cmd == 'q':
-            print("Exiting...")
-            sys.exit(0)
-        elif cmd in ['a', 'd', 't', 'l', 'x', 's']:
-            send_command(ser, cmd)
-        else:
-            print("Invalid command!")
-
 # ==================== MAIN ====================
 
 def main():
@@ -394,11 +368,6 @@ def main():
         time.sleep(0.1)
         
     print(f"Telemetry received! ({telemetry.packet_count} packets)")
-    
-    # Start command interface in background
-    # (Disabled for now since it blocks - use keyboard commands in plot window instead)
-    # cmd_thread = threading.Thread(target=command_interface, args=(ser,), daemon=True)
-    # cmd_thread.start()
     
     # Start real-time plotting
     print("Starting plots...")
