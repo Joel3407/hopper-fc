@@ -105,12 +105,13 @@ second of the Teensy's two serial ports.
 - Tilt readings from the IMU.
 - Ground-station frame parser: 6 tests in `ground-station/test_parser.py`
   (host-side only, no hardware involved).
+- Telemetry on real hardware: 33 valid frames in 3 s at 10 Hz, 0 bad
+  checksums, decoded host-side.
+- Ground station run live over `SerialUSB1`: roll, pitch and altitude tracked
+  tilt and lift. A screen recording exists (not linked).
 
 **Written but not verified**
 
-- Telemetry on real hardware (the firmware builds; it has not been flashed with
-  the ground station connected).
-- Ground-station plots.
 - Control: PID gains, Kalman filter tuning and the state machine.
 - Safety checks.
 - Actuators: servo and ESC output, vane mixing, `HOVER_BASE_US` and the
