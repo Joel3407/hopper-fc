@@ -42,8 +42,12 @@ static constexpr float ALT_LIMIT_M    = 20.0f;
 // values below (limits, centre, scaling) are untested placeholders.
 static constexpr int SERVO_CENTER_US = 1500;
 static constexpr int VANE_MAX_DELTA  = 400;   // ±µs from center
-static constexpr int ESC_IDLE_US     = 1000;
+static constexpr int ESC_MIN_US      = 1000;  // Flycolor 120A: zero throttle
 static constexpr int ESC_MAX_US      = 2000;
+static constexpr int ESC_BENCH_MAX_US = 1200; // cap for the 'e' bench test only
+static constexpr uint32_t ESC_BOOT_HOLD_MS  = 4000;  // hold ESC_MIN_US this long after boot
+static constexpr uint32_t ESC_BENCH_RAMP_MS = 3000;
+static constexpr uint32_t ESC_BENCH_HOLD_MS = 2000;
 static constexpr int HOVER_BASE_US   = 1500;  // UNVERIFIED guess (50% throttle); no fan to tune against yet
 
 // ---- Control scaling --------------------------------------------------------
@@ -176,6 +180,52 @@ bool     fatal_err       = false;
 uint32_t led_last_ms     = 0;
 bool     led_state       = false;
 
+// ---- ESC output (the ONLY place that writes esc_servo) ----------------------
+static void enter_state(FlightState s);  // defined in Section 8
+
+// Map throttle 0..1 to ESC_MIN_US..ESC_MAX_US, clamp, write, return the µs.
+// NaN and out-of-range inputs collapse to the clamp limits (NaN -> minimum).
+static int esc_write_throttle(float throttle) {
+    if (!(throttle > 0.0f)) throttle = 0.0f;
+    if (throttle > 1.0f)    throttle = 1.0f;
+    int us = ESC_MIN_US + (int)(throttle * (float)(ESC_MAX_US - ESC_MIN_US) + 0.5f);
+    us = constrain(us, ESC_MIN_US, ESC_MAX_US);
+    esc_servo.writeMicroseconds(us);
+    return us;
+}
+
+static float esc_throttle_from_us(int us) {
+    return (float)(us - ESC_MIN_US) / (float)(ESC_MAX_US - ESC_MIN_US);
+}
+
+// True once ESC_BOOT_HOLD_MS has passed since boot (millis() starts at boot).
+static bool esc_boot_hold_done() { return millis() >= ESC_BOOT_HOLD_MS; }
+
+#ifdef ESC_BENCH_TEST
+// ---- ESC bench test: ARMED only, ramp -> hold -> back to minimum ------------
+enum BenchPhase { BENCH_OFF = 0, BENCH_ON };
+static BenchPhase bench_phase    = BENCH_OFF;
+static uint32_t   bench_start_ms = 0;
+
+static void bench_cancel(const char* why) {
+    if (bench_phase == BENCH_OFF) return;
+    bench_phase = BENCH_OFF;
+    Serial.printf("ESC bench test ended: %s\n", why);
+}
+
+// Throttle (0..1) requested by the bench test right now; 0 if not running.
+static float bench_throttle() {
+    if (bench_phase == BENCH_OFF) return 0.0f;
+    if (flight_state != ARMED) { bench_cancel("left ARMED"); return 0.0f; }
+    const float max_thr = esc_throttle_from_us(ESC_BENCH_MAX_US);
+    uint32_t el = millis() - bench_start_ms;
+    if (el < ESC_BENCH_RAMP_MS) return max_thr * (float)el / (float)ESC_BENCH_RAMP_MS;
+    if (el < ESC_BENCH_RAMP_MS + ESC_BENCH_HOLD_MS) return max_thr;
+    bench_cancel("complete");
+    return 0.0f;
+}
+#endif
+
 
 // =============================================================================
 // SECTION 3 — setup()
@@ -192,6 +242,10 @@ static bool enable_bno_reports() {
 }
 
 void setup() {
+    // ESC first: drive minimum throttle before anything else can stall or fail.
+    esc_servo.attach(PIN_ESC, ESC_MIN_US, ESC_MAX_US);
+    esc_write_throttle(0.0f);
+
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);
 
@@ -246,10 +300,8 @@ void setup() {
     servo_S.writeMicroseconds(SERVO_CENTER_US);
     servo_W.writeMicroseconds(SERVO_CENTER_US);
 
-    // ---- ESC: hold minimum throttle to arm -----------------------------------
-    esc_servo.attach(PIN_ESC);
-    esc_servo.writeMicroseconds(ESC_IDLE_US);
-    delay(1000);  // ESC arm window
+    // ---- ESC: already attached and held at ESC_MIN_US at the top of setup() --
+    // The ESC_BOOT_HOLD_MS arm window is enforced non-blockingly in the 'a' command.
     Serial.println("OK: Servos + ESC");
 
     // ---- Baro ground calibration for AGL reference --------------------------
@@ -275,7 +327,11 @@ void setup() {
     kf_vel = 0.0f;
     Serial.printf("Ground MSL = %.2f m  (AGL will be relative to this)\n", ground_alt_msl);
 
-    Serial.println("=== HOPPER-FC READY ===  a=arm  d=disarm  t=takeoff  l=land  x=abort  r=reset(from ABORT)  s=status");
+    Serial.println("=== HOPPER-FC READY ===  a=arm  d=disarm  t=takeoff  l=land  x=abort  r=reset(from ABORT)  s=status"
+#ifdef ESC_BENCH_TEST
+                   "  e=ESC bench test (ARMED only)"
+#endif
+    );
 }
 
 
@@ -419,7 +475,7 @@ void safety_check() {
         do_abort = true;
     }
 
-    if (do_abort) flight_state = ABORT;
+    if (do_abort) enter_state(ABORT);
 }
 
 
@@ -459,7 +515,7 @@ void attitude_control(float dt) {
 
 int altitude_control(float setpoint_m, float dt) {
     float corr = compute_pid(setpoint_m, state_est.alt_agl_m, dt, GAINS_ALT, pid_alt);
-    return constrain(HOVER_BASE_US + (int)(corr * ALT_SCALE), ESC_IDLE_US, ESC_MAX_US);
+    return constrain(HOVER_BASE_US + (int)(corr * ALT_SCALE), ESC_MIN_US, ESC_MAX_US);
 }
 
 
@@ -473,6 +529,14 @@ int altitude_control(float setpoint_m, float dt) {
 static void enter_state(FlightState s) {
     flight_state   = s;
     state_entry_ms = millis();
+    // Any transition into a no-throttle state forces minimum immediately,
+    // without waiting for the next actuate().
+    if (s == PREFLIGHT || s == ARMED || s == LANDED || s == ABORT) {
+        esc_write_throttle(0.0f);
+    }
+#ifdef ESC_BENCH_TEST
+    if (s != ARMED) bench_cancel("state change");
+#endif
 }
 
 void run_state_machine(float dt) {
@@ -482,23 +546,23 @@ void run_state_machine(float dt) {
 
     // ---- PREFLIGHT: sit idle, servos centered, motor off -------------------
     case PREFLIGHT:
-        cmds = { 0.0f, 0.0f, 0.0f, ESC_IDLE_US };
+        cmds = { 0.0f, 0.0f, 0.0f, ESC_MIN_US };
         break;
 
     // ---- ARMED: motor idle, waiting for takeoff command --------------------
     case ARMED:
-        cmds = { 0.0f, 0.0f, 0.0f, ESC_IDLE_US };
+        cmds = { 0.0f, 0.0f, 0.0f, ESC_MIN_US };
         break;
 
     // ---- TAKEOFF: ramp throttle + attitude hold, transition when at alt ----
     case TAKEOFF: {
         // Linear throttle ramp from idle to hover base over TAKEOFF_RAMP_S
         float ramp   = constrain(t / TAKEOFF_RAMP_S, 0.0f, 1.0f);
-        int   base   = ESC_IDLE_US + (int)(ramp * (HOVER_BASE_US - ESC_IDLE_US));
+        int   base   = ESC_MIN_US + (int)(ramp * (HOVER_BASE_US - ESC_MIN_US));
 
         attitude_control(dt);
         float alt_corr = compute_pid(HOVER_ALT_M, state_est.alt_agl_m, dt, GAINS_ALT, pid_alt);
-        cmds.throttle_us = constrain(base + (int)(alt_corr * ALT_SCALE), ESC_IDLE_US, ESC_MAX_US);
+        cmds.throttle_us = constrain(base + (int)(alt_corr * ALT_SCALE), ESC_MIN_US, ESC_MAX_US);
 
         // Transition when within 10% of setpoint and ramp is complete
         if (t > TAKEOFF_RAMP_S && state_est.alt_agl_m >= HOVER_ALT_M * 0.9f) {
@@ -532,12 +596,12 @@ void run_state_machine(float dt) {
 
     // ---- LANDED: motor off, wait for operator disarm -----------------------
     case LANDED:
-        cmds = { 0.0f, 0.0f, 0.0f, ESC_IDLE_US };
+        cmds = { 0.0f, 0.0f, 0.0f, ESC_MIN_US };
         break;
 
     // ---- ABORT: cut motor immediately --------------------------------------
     case ABORT:
-        cmds = { 0.0f, 0.0f, 0.0f, ESC_IDLE_US };
+        cmds = { 0.0f, 0.0f, 0.0f, ESC_MIN_US };
         break;
     }
 }
@@ -561,14 +625,19 @@ static int clamp_vane(int us) {
 
 // UNTESTED ON HARDWARE: never run with real servos or an ESC attached.
 void actuate() {
-    // Safe states: center all vanes, kill throttle
+    // Safe states: center all vanes, force minimum throttle. The only
+    // exception is the ARMED-only ESC bench test (compiled out by default).
     if (flight_state == PREFLIGHT || flight_state == ARMED ||
         flight_state == LANDED    || flight_state == ABORT) {
         servo_N.writeMicroseconds(SERVO_CENTER_US);
         servo_E.writeMicroseconds(SERVO_CENTER_US);
         servo_S.writeMicroseconds(SERVO_CENTER_US);
         servo_W.writeMicroseconds(SERVO_CENTER_US);
-        esc_servo.writeMicroseconds(ESC_IDLE_US);
+        float thr = 0.0f;
+#ifdef ESC_BENCH_TEST
+        if (flight_state == ARMED && esc_boot_hold_done()) thr = bench_throttle();
+#endif
+        esc_write_throttle(thr);
         return;
     }
 
@@ -582,7 +651,8 @@ void actuate() {
     servo_S.writeMicroseconds(clamp_vane(SERVO_CENTER_US + p + y));
     servo_W.writeMicroseconds(clamp_vane(SERVO_CENTER_US - r - y));
 
-    esc_servo.writeMicroseconds(constrain(cmds.throttle_us, ESC_IDLE_US, ESC_MAX_US));
+    // Only TAKEOFF, HOVER and LANDING reach here.
+    esc_write_throttle(esc_throttle_from_us(cmds.throttle_us));
 }
 
 
@@ -678,10 +748,19 @@ void handle_serial() {
     if (!Serial.available()) return;
     char cmd = (char)Serial.read();
 
+#ifdef ESC_BENCH_TEST
+    // Any command other than 'e' cancels a running bench test (line endings
+    // from the serial monitor are not commands).
+    if (cmd != 'e' && cmd != '\r' && cmd != '\n') bench_cancel("other command");
+#endif
+
     switch (cmd) {
 
     case 'a':  // Arm
-        if (flight_state == PREFLIGHT || flight_state == LANDED) {
+        if (!esc_boot_hold_done()) {
+            Serial.printf("Cannot arm: ESC boot hold, wait %lu ms\n",
+                          (unsigned long)(ESC_BOOT_HOLD_MS - millis()));
+        } else if (flight_state == PREFLIGHT || flight_state == LANDED) {
             reset_pid(pid_pitch); reset_pid(pid_roll);
             reset_pid(pid_yaw);   reset_pid(pid_alt);
             yaw_hold_deg = state_est.yaw_deg;
@@ -704,6 +783,10 @@ void handle_serial() {
         break;
 
     case 't':  // Takeoff
+#ifdef ESC_BENCH_TEST
+        Serial.println("Disabled in bench build");
+        break;
+#endif
         if (flight_state == ARMED) {
             reset_pid(pid_pitch); reset_pid(pid_roll);
             reset_pid(pid_yaw);   reset_pid(pid_alt);
@@ -715,6 +798,10 @@ void handle_serial() {
         break;
 
     case 'l':  // Land
+#ifdef ESC_BENCH_TEST
+        Serial.println("Disabled in bench build");
+        break;
+#endif
         if (flight_state == HOVER) {
             landing_start_alt = state_est.alt_agl_m;  // descend from current altitude
             reset_pid(pid_pitch); reset_pid(pid_roll);
@@ -739,6 +826,23 @@ void handle_serial() {
             Serial.printf("Cannot reset from %s\n", state_name(flight_state));
         }
         break;
+
+#ifdef ESC_BENCH_TEST
+    case 'e':  // ESC bench test: ARMED only, ramp to ESC_BENCH_MAX_US, hold, back to min
+        if (flight_state != ARMED) {
+            Serial.printf("Bench test needs ARMED, not %s\n", state_name(flight_state));
+        } else if (bench_phase != BENCH_OFF) {
+            Serial.println("Bench test already running");
+        } else {
+            bench_phase    = BENCH_ON;
+            bench_start_ms = millis();
+            Serial.printf("ESC bench test: ramp to %d us over %lu ms, hold %lu ms. "
+                          "Any other command cancels.\n",
+                          ESC_BENCH_MAX_US, (unsigned long)ESC_BENCH_RAMP_MS,
+                          (unsigned long)ESC_BENCH_HOLD_MS);
+        }
+        break;
+#endif
 
     case 's':  // Status (alt = Kalman-filtered AGL, baro = raw baro AGL)
         Serial.printf("[%s] roll=%.1f° pitch=%.1f° yaw=%.1f° | "
