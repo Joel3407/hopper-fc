@@ -2,7 +2,7 @@
 
 ## Summary
 
-hopper-fc is Teensy 4.1 firmware for a planned electric-ducted-fan hopper steered by four thrust vanes, plus a Python ground station that plots its telemetry. It is bench-tested only: sensors, telemetry and ground station work on my desk, and nothing has been connected to an actuator. It demonstrates sensor bring-up, a fixed-rate control loop, a small serial protocol and host-side testing, and records plainly what is not verified.
+hopper-fc is Teensy 4.1 firmware for a planned electric-ducted-fan hopper steered by four thrust vanes, plus a Python ground station that plots its telemetry. It is bench-tested only: sensors, telemetry and ground station work on my desk, and the only actuator connected is the ESC and fan, for a capped bench ramp. It demonstrates sensor bring-up, a fixed-rate control loop, a small serial protocol and host-side testing, and records plainly what is not verified.
 
 ## The problem
 
@@ -36,12 +36,13 @@ I want to work toward guidance, navigation and control for liquid rockets. A thr
 - Telemetry: 33 valid frames in 3 s (about 10 Hz) with 0 bad checksums, decoded on the host.
 - Parser unit tests pass 6/6 (host-side only).
 - The ground station ran live against the board on `SerialUSB1`. Plots tracked roll, pitch and altitude as I tilted and lifted it. A 60-second screen recording exists.
+- The Flycolor 120A ESC is wired to pin 6 with a shared ground, and its BEC reads 5.08 V. With the Teensy arming it and the EDF fan still attached, the motor did not turn at a 1150 us cap and did start turning at 1200 us, from a bench-only capped ramp (`ESC_BENCH_TEST`).
 
 ## Not yet done
 
-- No airframe, vanes, servos, ESC or fan exist. The servo and ESC output code has never run on real actuators.
+- No servos, vanes, airframe or flight. The servo output code has never run on real servos.
 - Closed-loop control and flight are unverified: PID gains, Kalman tuning, the state machine and safety aborts have not run on a vehicle.
-- No real battery has been connected to the INA219.
+- No real battery has been connected to the INA219, so it is unverified that the low-voltage abort works.
 - SD logging is disabled (a commented-out placeholder).
 - LoRa telemetry has not been started in the current firmware.
 - GPS is read but not used.

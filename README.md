@@ -4,13 +4,13 @@ Flight-computer firmware for a planned electric-ducted-fan (EDF) hopper that
 steers with four thrust vanes, plus a Python ground station that plots its
 telemetry. The aim is a testbed for guidance, navigation and control code.
 
-**Current state:** the airframe, vanes, servos, ESC and fan do not exist yet.
-The only hardware is a Teensy 4.1 on a breadboard with the sensors listed
-below. Nothing here has flown or controlled anything.
+**Current state:** the airframe, vanes and servos do not exist yet.
+The hardware is a Teensy 4.1 on a breadboard with the sensors listed below,
+plus the ESC and fan described under Status. Nothing here has flown.
 
 ## Hardware
 
-Only the first four rows exist today.
+Every row except the vane servos exists today.
 
 | Part | Role | Connection |
 |---|---|---|
@@ -20,7 +20,7 @@ Only the first four rows exist today.
 | INA219 | Battery voltage and current | I2C, address 0x40 |
 | GY-GPS6MV2 GPS (NEO-6M class) | Position (read but not used yet) | `Serial1`, 9600 baud |
 | 4 vane servos (N/E/S/W) | Thrust-vector vanes | Planned, not built |
-| EDF ESC | Fan throttle | Planned, not built |
+| Flycolor 120A ESC | Fan throttle | Pin 6, shared ground |
 
 Pin assignments in the code (`src/main.cpp`):
 
@@ -109,17 +109,19 @@ second of the Teensy's two serial ports.
   checksums, decoded host-side.
 - Ground station run live over `SerialUSB1`: roll, pitch and altitude tracked
   tilt and lift. A screen recording exists (not linked).
+- The Flycolor 120A ESC is wired to pin 6 with a shared ground, and its BEC reads 5.08 V. With the Teensy arming it and the EDF fan still attached, the motor did not turn at a 1150 us cap and did start turning at 1200 us, from a bench-only capped ramp (`ESC_BENCH_TEST`).
 
 **Written but not verified**
 
 - Control: PID gains, Kalman filter tuning and the state machine.
-- Safety checks.
-- Actuators: servo and ESC output, vane mixing, `HOVER_BASE_US` and the
+- Safety checks. It is unverified that the low-voltage abort works, because the
+  INA219 is not on the battery.
+- Actuators: servo output, vane mixing, `HOVER_BASE_US` and the
   `ROLL_SIGN`/`PITCH_SIGN` axis signs. None of this has been run with real
-  servos or an ESC.
+  servos. ESC output has only been run in the bench ramp above.
 
 **Not started**
 
 - SD card logging (commented out).
 - LoRa radio telemetry.
-- Airframe, vanes and fan.
+- Servos, vanes, airframe or flight.
