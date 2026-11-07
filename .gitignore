@@ -8,3 +8,7 @@
 
 .venv/
 __pycache__/
+
+# clangd, generated per machine
+compile_commands.json
+.cache/
