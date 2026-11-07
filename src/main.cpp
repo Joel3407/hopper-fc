@@ -38,7 +38,8 @@ static constexpr float TILT_LIMIT_DEG = 45.0f;
 static constexpr float ALT_LIMIT_M = 20.0f;
 
 // ---- Servo / ESC limits -----------------------------------------------------
-// UNTESTED ON HARDWARE: no servos, ESC, vanes or fan exist yet. All servo/ESC
+// ESC output is bench-tested at low throttle only (capped ramp, ESC_BENCH_TEST).
+// Servos and vanes are still UNTESTED: they do not exist yet, so the servo
 // values below (limits, centre, scaling) are untested placeholders.
 static constexpr int SERVO_CENTER_US = 1500;
 static constexpr int VANE_MAX_DELTA = 400;  // ±µs from center
